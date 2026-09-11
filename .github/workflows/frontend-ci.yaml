@@ -6,6 +6,9 @@ on:
       - main
     paths:
       - 'starter/frontend/**'
+  push:
+    paths:
+      - 'starter/frontend/**'
   workflow_dispatch:
 
 concurrency:

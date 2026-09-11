@@ -6,6 +6,9 @@ on:
       - main
     paths:
       - 'starter/backend/**'
+  push:
+    paths:
+      - 'starter/backend/**'
   workflow_dispatch:
 
 concurrency:
