@@ -1,3 +1,4 @@
+"""Movie Picture Backend Service Module."""
 import os
 from flask import Flask
 from flask_cors import CORS

@@ -1,3 +1,4 @@
+// Movie Picture Web Catalog Application
 import React, { useState } from 'react';
 import MovieList from './components/MovieList';
 import MovieDetails from './components/MovieDetails';
