@@ -1,0 +1,215 @@
+name: Frontend Continuous Deployment
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'starter/frontend/**'
+  workflow_dispatch:
+    inputs:
+      backend_api_url:
+        description: 'Optional Backend API URL override for REACT_APP_MOVIE_API_URL'
+        required: false
+        default: ''
+
+concurrency:
+  group: frontend-cd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  lint:
+    name: Frontend Code Linting
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: starter/frontend
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js runtime (v18.14.2)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18.14.2
+          cache: 'npm'
+          cache-dependency-path: 'starter/frontend/package-lock.json'
+
+      - name: Install dependencies cleanly
+        run: npm ci
+
+      - name: Execute ESLint check
+        run: npm run lint
+
+  test:
+    name: Frontend Test Suite
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: starter/frontend
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js runtime (v18.14.2)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18.14.2
+          cache: 'npm'
+          cache-dependency-path: 'starter/frontend/package-lock.json'
+
+      - name: Install dependencies cleanly
+        run: npm ci
+
+      - name: Execute Jest test suites
+        run: CI=true npm test
+
+  build:
+    name: Build & Push Docker Image to ECR
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: starter/frontend
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION || 'us-east-1' }}
+
+      - name: Authenticate with Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, Tag, and Push Frontend Docker Image
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.FRONTEND_ECR_REPO || 'frontend' }}
+          IMAGE_TAG: ${{ github.sha }}
+          API_URL_INPUT: ${{ github.event.inputs.backend_api_url }}
+          API_URL_SECRET: ${{ secrets.REACT_APP_MOVIE_API_URL }}
+        run: |
+          # Strip protocol or registry prefix if full URL was supplied in secret
+          REPO_NAME=$(echo "$ECR_REPOSITORY" | awk -F'/' '{print $NF}')
+          TARGET_IMAGE="$ECR_REGISTRY/$REPO_NAME:$IMAGE_TAG"
+          LATEST_IMAGE="$ECR_REGISTRY/$REPO_NAME:latest"
+
+          # Determine Backend API URL
+          BACKEND_URL="${API_URL_INPUT:-${API_URL_SECRET:-http://localhost:5000}}"
+          echo "Building frontend image targeting backend API: $BACKEND_URL"
+
+          # Build container image with Git SHA tag and build arguments
+          docker build \
+            --build-arg REACT_APP_MOVIE_API_URL="$BACKEND_URL" \
+            --tag "$TARGET_IMAGE" \
+            --tag "$LATEST_IMAGE" \
+            .
+
+          echo "Pushing frontend Docker image to ECR ($TARGET_IMAGE)..."
+          docker push "$TARGET_IMAGE"
+          docker push "$LATEST_IMAGE"
+
+          echo "image_uri=$TARGET_IMAGE" >> $GITHUB_OUTPUT
+
+      - name: Step Summary - Build Artifacts
+        if: always()
+        run: |
+          echo "### 📦 Frontend Image Build & Registry Push" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image Tag (Git SHA):** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target Image:** \`${{ steps.build-image.outputs.image_uri }}\`" >> $GITHUB_STEP_SUMMARY
+
+  deploy:
+    name: Deploy Frontend to EKS Cluster
+    needs: [build]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Install Kustomize CLI
+        uses: imranismail/setup-kustomize@v2
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION || 'us-east-1' }}
+
+      - name: Authenticate with Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Configure Kubernetes kubeconfig for EKS
+        env:
+          CLUSTER_NAME: ${{ secrets.EKS_CLUSTER_NAME || 'cluster' }}
+          AWS_REGION: ${{ secrets.AWS_DEFAULT_REGION || 'us-east-1' }}
+        run: |
+          echo "Updating kubeconfig for cluster: $CLUSTER_NAME in $AWS_REGION"
+          aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+
+      - name: Update Manifests with Git SHA Image and Apply to Cluster
+        id: deploy-k8s
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.FRONTEND_ECR_REPO || 'frontend' }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          cd starter/frontend/k8s
+          REPO_NAME=$(echo "$ECR_REPOSITORY" | awk -F'/' '{print $NF}')
+          FULL_IMAGE_NAME="$ECR_REGISTRY/$REPO_NAME:$IMAGE_TAG"
+
+          echo "Updating Kustomize image configuration: frontend -> $FULL_IMAGE_NAME"
+          kustomize edit set image frontend="$FULL_IMAGE_NAME"
+
+          echo "Applying Kubernetes manifests via Kustomize..."
+          kustomize build | kubectl apply -f -
+
+      - name: Verify Deployment Rollout
+        id: rollout
+        run: |
+          echo "Awaiting deployment rollout status..."
+          kubectl rollout status deployment/frontend -n default --timeout=180s
+
+      - name: Fetch Service Details & Endpoints
+        if: always()
+        id: service-info
+        run: |
+          echo "Frontend Pod Status:"
+          kubectl get pods -l app=frontend -n default -o wide
+
+          echo "Frontend Service Status:"
+          kubectl get svc frontend -n default -o wide
+
+      - name: Handle Deployment Errors / Diagnostic Triage
+        if: failure()
+        run: |
+          echo "### ❌ Deployment Rollout Failure Diagnostics" >> $GITHUB_STEP_SUMMARY
+          echo "```bash" >> $GITHUB_STEP_SUMMARY
+          echo "--- Recent Events in default namespace ---" >> $GITHUB_STEP_SUMMARY
+          kubectl get events -n default --sort-by='.metadata.creationTimestamp' | tail -n 25 >> $GITHUB_STEP_SUMMARY
+          echo "--- Pod Description ---" >> $GITHUB_STEP_SUMMARY
+          kubectl describe deployment/frontend -n default >> $GITHUB_STEP_SUMMARY
+          echo "```" >> $GITHUB_STEP_SUMMARY
+
+      - name: Publish Deployment Summary
+        if: success()
+        run: |
+          echo "## 🎉 Frontend Deployment Successful!" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Environment** | Amazon EKS (\`${{ secrets.EKS_CLUSTER_NAME || 'cluster' }}\`) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Namespace** | \`default\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Deployment** | \`deployment/frontend\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image Tag (Git SHA)** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Rollout Status** | ✅ Successfully rolled out |" >> $GITHUB_STEP_SUMMARY

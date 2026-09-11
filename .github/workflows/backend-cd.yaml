@@ -1,0 +1,217 @@
+name: Backend Continuous Deployment
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'starter/backend/**'
+  workflow_dispatch:
+
+concurrency:
+  group: backend-cd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  lint:
+    name: Backend Code Linting
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: starter/backend
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Python runtime (v3.10)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Pipenv packaging tool
+        run: pip install pipenv
+
+      - name: Cache Pipenv virtual environment
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/virtualenvs
+          key: pipenv-${{ runner.os }}-backend-${{ hashFiles('starter/backend/Pipfile.lock') }}
+          restore-keys: |
+            pipenv-${{ runner.os }}-backend-
+
+      - name: Install dependencies cleanly
+        run: pipenv install --dev
+
+      - name: Execute Flake8 code linter
+        run: pipenv run lint
+
+  test:
+    name: Backend Test Suite
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: starter/backend
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Python runtime (v3.10)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Pipenv packaging tool
+        run: pip install pipenv
+
+      - name: Cache Pipenv virtual environment
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/virtualenvs
+          key: pipenv-${{ runner.os }}-backend-${{ hashFiles('starter/backend/Pipfile.lock') }}
+          restore-keys: |
+            pipenv-${{ runner.os }}-backend-
+
+      - name: Install dependencies cleanly
+        run: pipenv install --dev
+
+      - name: Execute Pytest test suite
+        run: pipenv run test
+
+  build:
+    name: Build & Push Docker Image to ECR
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION || 'us-east-1' }}
+
+      - name: Authenticate with Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, Tag, and Push Backend Docker Image
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.BACKEND_ECR_REPO || 'backend' }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          REPO_NAME=$(echo "$ECR_REPOSITORY" | awk -F'/' '{print $NF}')
+          TARGET_IMAGE="$ECR_REGISTRY/$REPO_NAME:$IMAGE_TAG"
+          LATEST_IMAGE="$ECR_REGISTRY/$REPO_NAME:latest"
+
+          echo "Building backend Docker image ($TARGET_IMAGE)..."
+          docker build \
+            --tag "$TARGET_IMAGE" \
+            --tag "$LATEST_IMAGE" \
+            starter/backend
+
+          echo "Pushing backend Docker image to ECR ($TARGET_IMAGE)..."
+          docker push "$TARGET_IMAGE"
+          docker push "$LATEST_IMAGE"
+
+          echo "image_uri=$TARGET_IMAGE" >> $GITHUB_OUTPUT
+
+      - name: Step Summary - Build Artifacts
+        if: always()
+        run: |
+          echo "### 📦 Backend Image Build & Registry Push" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image Tag (Git SHA):** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target Image:** \`${{ steps.build-image.outputs.image_uri }}\`" >> $GITHUB_STEP_SUMMARY
+
+  deploy:
+    name: Deploy Backend to EKS Cluster
+    needs: [build]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Install Kustomize CLI
+        uses: imranismail/setup-kustomize@v2
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION || 'us-east-1' }}
+
+      - name: Authenticate with Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Configure Kubernetes kubeconfig for EKS
+        env:
+          CLUSTER_NAME: ${{ secrets.EKS_CLUSTER_NAME || 'cluster' }}
+          AWS_REGION: ${{ secrets.AWS_DEFAULT_REGION || 'us-east-1' }}
+        run: |
+          echo "Updating kubeconfig for cluster: $CLUSTER_NAME in $AWS_REGION"
+          aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+
+      - name: Update Manifests with Git SHA Image and Apply to Cluster
+        id: deploy-k8s
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.BACKEND_ECR_REPO || 'backend' }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          cd starter/backend/k8s
+          REPO_NAME=$(echo "$ECR_REPOSITORY" | awk -F'/' '{print $NF}')
+          FULL_IMAGE_NAME="$ECR_REGISTRY/$REPO_NAME:$IMAGE_TAG"
+
+          echo "Updating Kustomize image configuration: backend -> $FULL_IMAGE_NAME"
+          kustomize edit set image backend="$FULL_IMAGE_NAME"
+
+          echo "Applying Kubernetes manifests via Kustomize..."
+          kustomize build | kubectl apply -f -
+
+      - name: Verify Deployment Rollout
+        id: rollout
+        run: |
+          echo "Awaiting backend deployment rollout status..."
+          kubectl rollout status deployment/backend -n default --timeout=180s
+
+      - name: Fetch Service Details & Endpoints
+        if: always()
+        id: service-info
+        run: |
+          echo "Backend Pod Status:"
+          kubectl get pods -l app=backend -n default -o wide
+
+          echo "Backend Service Status:"
+          kubectl get svc backend -n default -o wide
+
+      - name: Handle Deployment Errors / Diagnostic Triage
+        if: failure()
+        run: |
+          echo "### ❌ Backend Deployment Rollout Failure Diagnostics" >> $GITHUB_STEP_SUMMARY
+          echo "```bash" >> $GITHUB_STEP_SUMMARY
+          echo "--- Recent Events in default namespace ---" >> $GITHUB_STEP_SUMMARY
+          kubectl get events -n default --sort-by='.metadata.creationTimestamp' | tail -n 25 >> $GITHUB_STEP_SUMMARY
+          echo "--- Backend Pod Description ---" >> $GITHUB_STEP_SUMMARY
+          kubectl describe deployment/backend -n default >> $GITHUB_STEP_SUMMARY
+          echo "```" >> $GITHUB_STEP_SUMMARY
+
+      - name: Publish Deployment Summary
+        if: success()
+        run: |
+          echo "## 🎉 Backend Deployment Successful!" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Environment** | Amazon EKS (\`${{ secrets.EKS_CLUSTER_NAME || 'cluster' }}\`) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Namespace** | \`default\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Deployment** | \`deployment/backend\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image Tag (Git SHA)** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Rollout Status** | ✅ Successfully rolled out |" >> $GITHUB_STEP_SUMMARY

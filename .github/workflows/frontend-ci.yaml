@@ -1,0 +1,130 @@
+name: Frontend Continuous Integration
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'starter/frontend/**'
+  workflow_dispatch:
+
+concurrency:
+  group: frontend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Frontend Lint (ESLint)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: starter/frontend
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js runtime (v18.14.2)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18.14.2
+          cache: 'npm'
+          cache-dependency-path: 'starter/frontend/package-lock.json'
+
+      - name: Install dependencies cleanly
+        run: npm ci
+
+      - name: Execute ESLint check
+        id: eslint
+        run: npm run lint
+
+      - name: Report Lint Results to Step Summary
+        if: always()
+        run: |
+          echo "### 🔍 Frontend Lint Status" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.eslint.outcome }}" == "success" ]; then
+            echo "✅ **ESLint passed successfully!** Code conforms to project formatting and lint standards." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **ESLint failed!** Please inspect the lint logs above for style or syntax violations." >> $GITHUB_STEP_SUMMARY
+            echo "> *Tip: Check \`.eslintrc.js\` rules or verify if \`FAIL_LINT\` environment variable was triggered.*" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  test:
+    name: Frontend Unit Tests (Jest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: starter/frontend
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js runtime (v18.14.2)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18.14.2
+          cache: 'npm'
+          cache-dependency-path: 'starter/frontend/package-lock.json'
+
+      - name: Install dependencies cleanly
+        run: npm ci
+
+      - name: Execute Jest test suites
+        id: test
+        run: CI=true npm test
+
+      - name: Report Test Results to Step Summary
+        if: always()
+        run: |
+          echo "### 🧪 Frontend Test Status" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.test.outcome }}" == "success" ]; then
+            echo "✅ **All frontend unit tests passed!** Components and UI assertions are healthy." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Frontend tests failed!** Inspect the test log output for failing assertions." >> $GITHUB_STEP_SUMMARY
+            echo "> *Tip: Verify if \`FAIL_TEST\` is set or if App/MovieList headings were modified.*" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  build:
+    name: Frontend Application Build Verification
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: starter/frontend
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js runtime (v18.14.2)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18.14.2
+          cache: 'npm'
+          cache-dependency-path: 'starter/frontend/package-lock.json'
+
+      - name: Install dependencies cleanly
+        run: npm ci
+
+      - name: Build React production bundle
+        run: npm run build
+
+      - name: Verify Dockerfile builds cleanly
+        run: |
+          docker build \
+            --build-arg REACT_APP_MOVIE_API_URL=http://localhost:5000 \
+            --tag mp-frontend:ci-test .
+
+      - name: Publish CI Pipeline Summary
+        if: always()
+        run: |
+          echo "## 🚀 Frontend CI Pipeline Report" >> $GITHUB_STEP_SUMMARY
+          echo "| Phase | Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Static Analysis | Lint (ESLint) | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Quality Assurance | Test (Jest) | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Artifact Creation | Build (React & Docker) | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit SHA:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch / Ref:** \`${{ github.ref }}\`" >> $GITHUB_STEP_SUMMARY

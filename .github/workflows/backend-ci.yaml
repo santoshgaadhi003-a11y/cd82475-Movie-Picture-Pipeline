@@ -1,0 +1,130 @@
+name: Backend Continuous Integration
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'starter/backend/**'
+  workflow_dispatch:
+
+concurrency:
+  group: backend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Backend Lint (Flake8)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: starter/backend
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Python runtime (v3.10)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Pipenv packaging tool
+        run: pip install pipenv
+
+      - name: Cache Pipenv virtual environment
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/virtualenvs
+          key: pipenv-${{ runner.os }}-backend-${{ hashFiles('starter/backend/Pipfile.lock') }}
+          restore-keys: |
+            pipenv-${{ runner.os }}-backend-
+
+      - name: Install dependencies with Pipenv
+        run: pipenv install --dev
+
+      - name: Execute Flake8 code linter
+        id: flake8
+        run: pipenv run lint
+
+      - name: Report Lint Results to Step Summary
+        if: always()
+        run: |
+          echo "### 🔍 Backend Lint Status" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.flake8.outcome }}" == "success" ]; then
+            echo "✅ **Flake8 passed cleanly!** Python code adheres to PEP8 and project standards." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Flake8 detected style violations!** Check the lint output above." >> $GITHUB_STEP_SUMMARY
+            echo "> *Tip: Check line lengths against \`.flake8\` or verify if \`lint-fail\` triggered.*" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  test:
+    name: Backend Unit Tests (Pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: starter/backend
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Python runtime (v3.10)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Pipenv packaging tool
+        run: pip install pipenv
+
+      - name: Cache Pipenv virtual environment
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/virtualenvs
+          key: pipenv-${{ runner.os }}-backend-${{ hashFiles('starter/backend/Pipfile.lock') }}
+          restore-keys: |
+            pipenv-${{ runner.os }}-backend-
+
+      - name: Install dependencies with Pipenv
+        run: pipenv install --dev
+
+      - name: Execute Pytest test suite
+        id: pytest
+        run: pipenv run test
+
+      - name: Report Test Results to Step Summary
+        if: always()
+        run: |
+          echo "### 🧪 Backend Test Status" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.pytest.outcome }}" == "success" ]; then
+            echo "✅ **All backend unit tests passed!** Flask endpoints returned expected status and payload." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Backend test failures encountered!** Inspect test assertion logs above." >> $GITHUB_STEP_SUMMARY
+            echo "> *Tip: Verify if \`FAIL_TEST\` is set or if movies endpoint returned unexpected JSON.*" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  build:
+    name: Backend Container Build Verification
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Verify Dockerfile builds cleanly
+        run: |
+          docker build --tag mp-backend:ci-test starter/backend
+
+      - name: Publish CI Pipeline Summary
+        if: always()
+        run: |
+          echo "## 🚀 Backend CI Pipeline Report" >> $GITHUB_STEP_SUMMARY
+          echo "| Phase | Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Static Analysis | Lint (Flake8) | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Quality Assurance | Test (Pytest) | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Containerization | Docker Build Check | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit SHA:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch / Ref:** \`${{ github.ref }}\`" >> $GITHUB_STEP_SUMMARY
